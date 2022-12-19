@@ -1,17 +1,19 @@
+mod db;
+
 use std::error::Error;
-use std::fmt::format;
-use std::io;
 use arboard::Clipboard;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, KeyCode};
 use crossterm::{event, execute};
 use crossterm::event::Event::Key;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use rusqlite::ErrorCode;
 use tui::backend::{Backend, CrosstermBackend};
 use tui::{Frame, Terminal};
 use tui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use tui::style::{Color, Modifier, Style};
 use tui::text::Span;
-use tui::widgets::{Block, Borders, BorderType, List, ListItem, ListState, Paragraph};
+use tui::widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph};
+use crate::db::Database;
 
 const APP_KEYS_DESC: &str = r#"
 L:           List
@@ -33,17 +35,42 @@ enum InputMode {
     Password,
     Submit,
     Search,
-    List
+    List,
+    Delete
 }
 
 #[derive(Clone)]
-struct Password {
+pub struct Password {
+    id: usize,
     title: String,
     username: String,
     password: String
 }
 
+impl Password {
+
+    pub fn new(title: String, username: String, password: String) -> Password {
+        Password {
+            id: 0,
+            title,
+            username,
+            password
+        }
+    }
+
+    pub fn new_with_id(id: usize, title: String, username: String, password: String) -> Password {
+        Password {
+            id,
+            title,
+            username,
+            password
+        }
+    }
+
+}
+
 struct PassMng {
+    db: Database,
     mode: InputMode,
     list_state: ListState,
     passwords: Vec<Password>,
@@ -51,21 +78,39 @@ struct PassMng {
     search_list: Vec<Password>,
     new_title: String,
     new_username: String,
-    new_password: String
+    new_password: String,
+    edit_mode: bool,
+    edit_index: Option<usize>
 }
 
 impl PassMng {
 
-    pub fn new() -> PassMng {
+    pub fn new(key: String) -> PassMng {
+        let db = match Database::new(key) {
+            Ok(db) => db,
+            Err(e) => {
+                if e.sqlite_error_code().unwrap() == ErrorCode::NotADatabase {
+                    println!("passphrase is not valid!");
+                    std::process::exit(1);
+                }else {
+                    println!("{}", e.to_string());
+                    std::process::exit(1);
+                }
+            }
+        };
+        let passwords = db.load();
         PassMng {
+            db,
             mode: InputMode::Normal,
             list_state: ListState::default(),
-            passwords: vec![],
+            passwords,
             search_txt: String::new(),
             search_list: vec![],
             new_title: String::new(),
             new_username: String::new(),
-            new_password: String::new()
+            new_password: String::new(),
+            edit_mode: false,
+            edit_index: None
         }
     }
 
@@ -80,14 +125,69 @@ impl PassMng {
     }
 
     pub fn insert(&mut self) {
-        let password = Password {
-            title: self.new_title.to_owned(),
-            username: self.new_username.to_owned(),
-            password: self.new_password.to_owned()
-        };
+        let password = Password::new(
+            self.new_title.to_owned(),
+            self.new_username.to_owned(),
+            self.new_password.to_owned()
+        );
+        self.db.insert(&password);
         self.passwords.push(password);
         self.clear_fields();
         self.change_mode(InputMode::Normal);
+    }
+
+    pub fn start_edit_mode(&mut self) {
+        if let Some(index) = self.list_state.selected() {
+            let password = &self.passwords[index];
+            self.new_title = password.title.to_owned();
+            self.new_username = password.username.to_owned();
+            self.new_password = password.password.to_owned();
+            self.edit_mode = true;
+            self.edit_index = Some(index);
+            self.change_mode(InputMode::Title);
+        }
+    }
+
+    pub fn edit(&mut self) {
+        let index = self.edit_index.unwrap();
+        let id = self.passwords[index].id;
+        let password = Password::new(
+            self.new_title.to_owned(),
+            self.new_username.to_owned(),
+            self.new_password.to_owned()
+        );
+        self.db.update(id, &password);
+        self.passwords[index] = password;
+        self.clear_fields();
+        self.end_edit_mode();
+        self.change_mode(InputMode::List);
+    }
+
+    pub fn end_edit_mode(&mut self) {
+        if self.edit_mode {
+            self.edit_mode = false;
+            self.edit_index = None;
+        }
+    }
+
+    pub fn check_delete(&mut self) {
+        if self.list_state.selected().is_some() {
+            self.change_mode(InputMode::Delete);
+        }
+    }
+
+    pub fn delete(&mut self) {
+        if let Some(index) = self.list_state.selected() {
+            let id = self.passwords[index].id;
+            self.passwords.remove(index);
+            self.db.delete(id);
+            if index > 0 {
+                self.list_state.select(Some(0));
+            }else {
+                self.list_state.select(None);
+            }
+            self.change_mode(InputMode::List);
+        }
     }
 
     pub fn search(&mut self) {
@@ -96,10 +196,63 @@ impl PassMng {
             .collect();
     }
 
+    pub fn move_up(&mut self) {
+        let selected = match self.list_state.selected() {
+            Some(v) => {
+                if v == 0 {
+                    Some(v)
+                }else {
+                    Some(v - 1)
+                }
+            }
+            None => {
+                Some(0)
+            }
+        };
+        self.list_state.select(selected);
+    }
+
+    pub fn move_down(&mut self) {
+        let selected = match self.list_state.selected() {
+            Some(v) => {
+                if v == self.passwords.len() - 1 {
+                    Some(v)
+                }else {
+                    Some(v + 1)
+                }
+            }
+            None => {
+                Some(0)
+            }
+        };
+        self.list_state.select(selected);
+    }
+
+    pub fn copy_username(&self) {
+        if let Some(index) = self.list_state.selected() {
+            let username = self.passwords[index].username.to_owned();
+            PassMng::copy(username);
+        }
+    }
+
+    pub fn copy_password(&self) {
+        if let Some(index) = self.list_state.selected() {
+            let password = self.passwords[index].password.to_owned();
+            PassMng::copy(password);
+        }
+    }
+
+    fn copy(content: String) {
+        let mut clipboard = Clipboard::new().unwrap();
+        clipboard.set_text(content).unwrap();
+    }
+
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut state = PassMng::new();
+    let password = rpassword::prompt_password("Enter passphrase: ").unwrap();
+    println!("passphrase: {}", password);
+    let mut state = PassMng::new(password);
     enable_raw_mode()?;
     execute!(
         std::io::stdout(),
@@ -223,7 +376,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut PassMng) -> Resul
                             state.change_mode(InputMode::Password);
                         }
                         KeyCode::Enter => {
-                            state.insert();
+                            if state.edit_mode {
+                                state.edit();
+                            }else {
+                                state.insert();
+                            }
                         }
                         _ => {}
                     }
@@ -249,7 +406,38 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut PassMng) -> Resul
                 InputMode::List => {
                     match key.code {
                         KeyCode::Esc => {
+                            state.list_state.select(None);
                             state.change_mode(InputMode::Normal);
+                        }
+                        KeyCode::Up => {
+                            state.move_up();
+                        }
+                        KeyCode::Down => {
+                            state.move_down();
+                        }
+                        KeyCode::Char('u') => {
+                            state.copy_username();
+                        }
+                        KeyCode::Char('p') => {
+                            state.copy_password();
+                        }
+                        KeyCode::Char('e') => {
+                            state.start_edit_mode();
+                        }
+                        KeyCode::Char('d') => {
+                            state.check_delete();
+                        }
+                        _ => {}
+                    }
+                }
+
+                InputMode::Delete => {
+                    match key.code {
+                        KeyCode::Char('n') => {
+                            state.change_mode(InputMode::List);
+                        }
+                        KeyCode::Char('y') => {
+                            state.delete();
                         }
                         _ => {}
                     }
@@ -284,6 +472,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, state: &mut PassMng) {
         .border_type(BorderType::Rounded);
     f.render_widget(list_section_block, parent_chunk[1]);
     list_section(f, state, parent_chunk[1]);
+
+    delete_popup(f, state);
 }
 
 fn new_section<B: Backend>(f: &mut Frame<B>, state: &mut PassMng, area: Rect) {
@@ -381,4 +571,62 @@ fn list_section<B: Backend>(f: &mut Frame<B>, state: &mut PassMng, area: Rect) {
         .highlight_symbol("->")
         .highlight_style(Style::default().add_modifier(Modifier::BOLD));
     f.render_stateful_widget(list, list_chunks[1], &mut state.list_state);
+}
+
+fn delete_popup<B: Backend>(f: &mut Frame<B>, state: &mut PassMng) {
+    if let InputMode::Delete = state.mode {
+        let block = Block::default()
+            .title("DELETE")
+            .title_alignment(Alignment::Center)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded);
+        let area = centered_rect(60, 25, f.size());
+        f.render_widget(Clear, area); //this clears out the background
+        f.render_widget(block, area);
+
+        let chunk = Layout::default()
+            .margin(2)
+            .constraints(
+                [
+                    Constraint::Length(2),
+                    Constraint::Length(2),
+                ].as_ref()
+            )
+            .split(area);
+
+        let text = Paragraph::new("Are you sure?")
+            .style(Style::default().fg(Color::Red))
+            .alignment(Alignment::Center);
+        f.render_widget(text, chunk[0]);
+
+        let keys_desc = Paragraph::new("Press (Y) for Yes and (N) for No")
+            .alignment(Alignment::Center);
+        f.render_widget(keys_desc, chunk[1]);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_y) / 2),
+                Constraint::Percentage(percent_y),
+                Constraint::Percentage((100 - percent_y) / 2),
+            ]
+                .as_ref(),
+        )
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_x) / 2),
+                Constraint::Percentage(percent_x),
+                Constraint::Percentage((100 - percent_x) / 2),
+            ]
+                .as_ref(),
+        )
+        .split(popup_layout[1])[1]
 }
