@@ -250,9 +250,8 @@ impl PassMng {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let password = rpassword::prompt_password("Enter passphrase: ").unwrap();
-    println!("passphrase: {}", password);
-    let mut state = PassMng::new(password);
+    let passphrase = rpassword::prompt_password("Enter Passphrase: ").unwrap();
+    let mut state = PassMng::new(passphrase);
     enable_raw_mode()?;
     execute!(
         std::io::stdout(),
