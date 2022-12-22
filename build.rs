@@ -62,7 +62,6 @@ fn link_openssl_static(lib_dir: &Path, _inc_dir: &Path) {
 
 fn find_openssl_dir(_host: &str, _target: &str) -> Option<PathBuf> {
     let openssl_dir = env("OPENSSL_DIR");
-    println!("openssl_dir = {:?}", openssl_dir);
     openssl_dir.map(PathBuf::from)
 }
 
